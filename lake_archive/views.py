@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from html import escape
 
-from .archive import ArchiveSummary, FrameView
+from .archive import ArchiveSummary, BatchView, FrameView
 
 
 def _mc(value: int) -> str:
@@ -105,7 +105,9 @@ def _fmt_opt(value) -> str:
 
 def archive_page(archive: ArchiveSummary, frames: list[FrameView],
                  notice: str | None = None, notice_kind: str = "ok",
-                 missing_seq: int | None = None) -> str:
+                 missing_seq: int | None = None,
+                 batches: list[BatchView] | None = None,
+                 byte_limit_value: str = "") -> str:
     parts = [
         "<nav><a href=\"/\">← 全部档案</a></nav>",
         "<h1>%s</h1>" % escape(archive.name),
@@ -131,6 +133,41 @@ def archive_page(archive: ArchiveSummary, frames: list[FrameView],
         " placeholder=\"输入帧序号\">"
         "<button type=\"submit\">查看该帧</button></form>" % archive.id
     )
+    parts.append("<h2>按字节上限分批导出</h2>")
+    parts.append(
+        "<form class=\"card\" method=\"post\" action=\"/archives/%d/batches\">"
+        "<label for=\"byte_limit\">每个 CSV 包的字节上限（字节，正整数）</label>"
+        "<input id=\"byte_limit\" name=\"byte_limit\" type=\"number\" min=\"1\" step=\"1\""
+        " required value=\"%s\" inputmode=\"numeric\" placeholder=\"例如 4096\">"
+        "<p class=\"muted small\">按帧号顺序装包：当前包放不下下一帧才另开一包；每包沿用原"
+        " CSV 的表头与布局。差值帧的基准若不在同一包内，该帧会改写成还原后的绝对值，因此每"
+        "个包都能独立还原测值。按实际导出字节计数（含表头与换行）。整批取自同一已提交状态并"
+        "立即固化，之后的更正不会改变这批文件。</p>"
+        "<button type=\"submit\">生成分批导出</button></form>"
+        % (archive.id, escape(byte_limit_value))
+    )
+    if batches:
+        parts.append("<h3>已生成的分批导出（固化快照）</h3>")
+        for b in batches:
+            parts.append(
+                "<div class=\"card\"><div class=\"kv\">"
+                "<dt>批次</dt><dd>#%d · 生成于 <span class=\"mono\">%s</span></dd>"
+                "<dt>字节上限</dt><dd class=\"mono\">%d 字节/包</dd>"
+                "<dt>覆盖</dt><dd>%d 帧 · %d 个包（不漏不重）</dd></div>"
+                "<table><thead><tr><th>包号</th><th>帧范围</th><th>帧数</th>"
+                "<th>实际字节</th><th>下载</th></tr></thead><tbody>"
+                % (b.id, escape(b.created_at), b.byte_limit,
+                   b.frame_count, b.package_count)
+            )
+            for p in b.packages:
+                parts.append(
+                    "<tr><td>%d</td><td class=\"mono\">%d – %d</td><td>%d</td>"
+                    "<td class=\"mono\">%d</td><td><a href=\"/archives/%d/batches/%d"
+                    "/packages/%d/download\">%s</a></td></tr>"
+                    % (p.package_no, p.first_seq, p.last_seq, p.frame_count,
+                       p.size_bytes, archive.id, b.id, p.package_no, escape(p.filename))
+                )
+            parts.append("</tbody></table></div>")
 
     trs = []
     for f in frames:

@@ -251,29 +251,47 @@ def parse_csv(data: bytes) -> tuple[list[FrameRow], CsvLayout]:
     return rows, layout
 
 
+def header_bytes(layout: CsvLayout) -> bytes:
+    """Render just the CSV header line (including its line terminator)."""
+    buf = io.StringIO(newline="")
+    csv.writer(buf, delimiter=layout.delimiter,
+               lineterminator=layout.lineterminator).writerow(list(layout.header))
+    return buf.getvalue().encode("utf-8")
+
+
+def render_frame_row(fr, layout: CsvLayout) -> bytes:
+    """Render one frame as a single CSV line (including its line terminator).
+
+    The frame is rendered in its current representation: an absolute frame
+    (``base_seq is None``) carries the restored value and no base reference;
+    a delta frame carries the stored difference and its base seq.
+    """
+    values = [""] * len(layout.header)
+    values[layout.col_seq] = str(fr.seq)
+    values[layout.col_time] = fr.sampled_at_raw
+    values[layout.col_value] = str(fr.stored_mc)
+    if layout.col_kind is not None:
+        # Echo the token the file used, which may be blank when the kind
+        # was inferred from a base reference.  The kind itself never
+        # changes, so the token stays valid.
+        values[layout.col_kind] = fr.kind_raw
+    if layout.col_base is not None:
+        values[layout.col_base] = "" if fr.base_seq is None else str(fr.base_seq)
+    extras = fr.extras or ()
+    for col, text in zip(layout.extra_cols, extras):
+        values[col] = text
+    buf = io.StringIO(newline="")
+    csv.writer(buf, delimiter=layout.delimiter,
+               lineterminator=layout.lineterminator).writerow(values)
+    return buf.getvalue().encode("utf-8")
+
+
 def render_csv(frames, layout: CsvLayout) -> bytes:
     """Render frames (FrameView objects) in the uploaded file's CSV layout.
 
     Columns this application does not manage are echoed back verbatim.
     """
-    buf = io.StringIO(newline="")
-    writer = csv.writer(buf, delimiter=layout.delimiter,
-                        lineterminator=layout.lineterminator)
-    writer.writerow(list(layout.header))
+    parts = [header_bytes(layout)]
     for fr in sorted(frames, key=lambda f: f.seq):
-        values = [""] * len(layout.header)
-        values[layout.col_seq] = str(fr.seq)
-        values[layout.col_time] = fr.sampled_at_raw
-        values[layout.col_value] = str(fr.stored_mc)
-        if layout.col_kind is not None:
-            # Echo the token the file used, which may be blank when the kind
-            # was inferred from a base reference.  The kind itself never
-            # changes, so the token stays valid.
-            values[layout.col_kind] = fr.kind_raw
-        if layout.col_base is not None:
-            values[layout.col_base] = "" if fr.base_seq is None else str(fr.base_seq)
-        extras = fr.extras or ()
-        for col, text in zip(layout.extra_cols, extras):
-            values[col] = text
-        writer.writerow(values)
-    return buf.getvalue().encode("utf-8")
+        parts.append(render_frame_row(fr, layout))
+    return b"".join(parts)

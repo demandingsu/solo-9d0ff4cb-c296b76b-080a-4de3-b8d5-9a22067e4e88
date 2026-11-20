@@ -54,6 +54,20 @@ class ConflictError(ArchiveError):
         super().__init__(message, status=409)
 
 
+class PackageError(ArchiveError):
+    """A frame cannot fit into a package even on its own."""
+
+    def __init__(self, seq: int, frame_size: int, byte_limit: int):
+        super().__init__(
+            "帧 %d 单独成行就有 %d 字节，超过每包 %d 字节的上限，无法装包。"
+            "请调大字节上限后重试。" % (seq, frame_size, byte_limit),
+            status=422,
+        )
+        self.seq = seq
+        self.frame_size = frame_size
+        self.byte_limit = byte_limit
+
+
 @dataclass(frozen=True)
 class FrameView:
     seq: int
@@ -74,6 +88,26 @@ class ArchiveSummary:
     source_filename: str
     frame_count: int
     created_at: str
+
+
+@dataclass(frozen=True)
+class PackageView:
+    package_no: int
+    filename: str
+    first_seq: int
+    last_seq: int
+    frame_count: int
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class BatchView:
+    id: int
+    byte_limit: int
+    frame_count: int
+    package_count: int
+    created_at: str
+    packages: tuple[PackageView, ...] = ()
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -371,3 +405,237 @@ def export_csv(db_path: str, archive_id: int) -> bytes:
     finally:
         conn.close()
     return csvio.render_csv(frames, layout)
+
+
+# ---------------------------------------------------------------------------
+# Size-limited export batches
+# ---------------------------------------------------------------------------
+
+def _absolute_kind_token(conn, archive_id: int) -> str:
+    """Pick a kind token spelling 'absolute' used by this archive, if any.
+
+    A delta frame rewritten as absolute must keep the kind column parseable;
+    prefer a token the source file itself already used, else the canonical
+    English token.  When the layout has no kind column the token is unused.
+    """
+    row = conn.execute(
+        "SELECT kind_raw FROM frame WHERE archive_id = ? AND base_seq IS NULL"
+        " AND kind_raw <> '' LIMIT 1",
+        (archive_id,),
+    ).fetchone()
+    return row["kind_raw"] if row is not None else "absolute"
+
+
+def _as_absolute(frame: FrameView, kind_token: str) -> FrameView:
+    """Return the frame rendered as an absolute value frame.
+
+    Used when a delta frame's base is not in the same package: the package
+    must restore its measurements on its own, so the frame is emitted with
+    its restored temperature and without any base reference.
+    """
+    return FrameView(
+        seq=frame.seq,
+        sampled_at=frame.sampled_at,
+        sampled_at_raw=frame.sampled_at_raw,
+        restored_mc=frame.restored_mc,
+        base_seq=None,
+        stored_kind="absolute",
+        stored_mc=frame.restored_mc,
+        kind_raw=kind_token,
+        extras=frame.extras,
+    )
+
+
+def _plan_packages(frames: list[FrameView], layout: csvio.CsvLayout,
+                   byte_limit: int, kind_token: str):
+    """Split ordered frames into packages that each fit within byte_limit.
+
+    Frames are visited in seq order and added to the current package while
+    the *rendered* file size (header and line terminators included) stays at
+    or under the limit; the frame that would overflow opens the next package.
+    A delta frame whose base is not present in the package it is about to
+    join is rewritten as an absolute frame, so every package restores all of
+    its measurements independently.  Returns a list of ``(frames, payload)``
+    tuples; raises :class:`PackageError` if a frame alone cannot fit.
+    """
+    header = csvio.header_bytes(layout)
+    packages: list[tuple[list[FrameView], bytes]] = []
+
+    current: list[FrameView] = []
+    current_size = len(header)
+    current_bases: set[int] = set()
+
+    for fr in frames:
+        if fr.base_seq is not None and fr.base_seq not in current_bases:
+            candidate = _as_absolute(fr, kind_token)
+        else:
+            candidate = fr
+        row_bytes = len(csvio.render_frame_row(candidate, layout))
+
+        if current and current_size + row_bytes > byte_limit:
+            # The current package is full; seal it and open the next one.
+            packages.append((current, header + b"".join(
+                csvio.render_frame_row(x, layout) for x in current)))
+            current = []
+            current_size = len(header)
+            current_bases = set()
+            candidate = _as_absolute(fr, kind_token) if fr.base_seq is not None else fr
+            row_bytes = len(csvio.render_frame_row(candidate, layout))
+
+        if len(header) + row_bytes > byte_limit:
+            raise PackageError(fr.seq, row_bytes, byte_limit)
+
+        current.append(candidate)
+        current_size += row_bytes
+        current_bases.add(fr.seq)
+
+    if current:
+        packages.append((current, header + b"".join(
+            csvio.render_frame_row(x, layout) for x in current)))
+    return packages
+
+
+def create_export_batch(dbp: str, archive_id: int, byte_limit: int) -> int:
+    """Render a size-limited, immutable export batch from one committed state.
+
+    All frames are read inside one ``BEGIN IMMEDIATE`` transaction, so the
+    whole batch reflects a single committed state (a concurrent correction is
+    serialized before or after it, never half-visible).  Every package is
+    rendered in memory first; the batch rows are inserted only once all
+    packages fit, and any failure rolls the transaction back without leaving
+    a half batch behind.
+    """
+    if not isinstance(byte_limit, int) or byte_limit <= 0:
+        raise ArchiveError("每包字节上限必须是正整数。")
+
+    conn = connect(dbp)
+    try:
+        with _transaction(conn):
+            _archive_row(conn, archive_id)
+            layout = csvio.CsvLayout.from_json(conn.execute(
+                "SELECT layout_json FROM archive WHERE id = ?", (archive_id,)
+            ).fetchone()["layout_json"])
+            rows = conn.execute(
+                "SELECT * FROM frame WHERE archive_id = ? ORDER BY seq", (archive_id,)
+            ).fetchall()
+            if not rows:
+                raise ArchiveError("该档案没有任何帧，无法生成导出包。", status=404)
+            by_seq = {r["seq"]: r["restored_mc"] for r in rows}
+            frames = [
+                _view(r, by_seq.get(r["base_seq"]) if r["base_seq"] is not None else None)
+                for r in rows
+            ]
+            kind_token = _absolute_kind_token(conn, archive_id)
+
+            # Pure in-memory planning: PackageError here aborts before any
+            # insert, and the transaction rolls back untouched.
+            planned = _plan_packages(frames, layout, byte_limit, kind_token)
+
+            cur = conn.execute(
+                "INSERT INTO export_batch (archive_id, byte_limit, frame_count,"
+                " package_count) VALUES (?, ?, ?, ?)",
+                (archive_id, byte_limit, len(frames), len(planned)),
+            )
+            batch_id = cur.lastrowid
+            source = conn.execute(
+                "SELECT source_filename FROM archive WHERE id = ?", (archive_id,)
+            ).fetchone()["source_filename"]
+            base_name, dot, ext = source.rpartition(".")
+            if dot and base_name:
+                suffix = "." + ext
+            else:
+                suffix = ".csv"
+
+            for no, (pkg_frames, payload) in enumerate(planned, start=1):
+                filename = "archive-%d-batch-%d-p%d%s" % (
+                    archive_id, batch_id, no, suffix)
+                conn.execute(
+                    "INSERT INTO export_package (batch_id, package_no, filename,"
+                    " first_seq, last_seq, frame_count, size_bytes, payload_bytes)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (batch_id, no, filename, pkg_frames[0].seq, pkg_frames[-1].seq,
+                     len(pkg_frames), len(payload), payload),
+                )
+        return batch_id
+    finally:
+        conn.close()
+
+
+def list_batches(dbp: str, archive_id: int) -> list[BatchView]:
+    conn = connect(dbp)
+    try:
+        _archive_row(conn, archive_id)
+        batch_rows = conn.execute(
+            "SELECT * FROM export_batch WHERE archive_id = ? ORDER BY id", (archive_id,)
+        ).fetchall()
+        out: list[BatchView] = []
+        for b in batch_rows:
+            pkg_rows = conn.execute(
+                "SELECT package_no, filename, first_seq, last_seq, frame_count,"
+                " size_bytes FROM export_package WHERE batch_id = ? ORDER BY package_no",
+                (b["id"],),
+            ).fetchall()
+            out.append(BatchView(
+                id=b["id"], byte_limit=b["byte_limit"],
+                frame_count=b["frame_count"], package_count=b["package_count"],
+                created_at=b["created_at"],
+                packages=tuple(
+                    PackageView(package_no=p["package_no"], filename=p["filename"],
+                                first_seq=p["first_seq"], last_seq=p["last_seq"],
+                                frame_count=p["frame_count"], size_bytes=p["size_bytes"])
+                    for p in pkg_rows),
+            ))
+        return out
+    finally:
+        conn.close()
+
+
+def get_batch(dbp: str, archive_id: int, batch_id: int) -> BatchView:
+    conn = connect(dbp)
+    try:
+        _archive_row(conn, archive_id)
+        b = conn.execute(
+            "SELECT * FROM export_batch WHERE id = ? AND archive_id = ?",
+            (batch_id, archive_id),
+        ).fetchone()
+        if b is None:
+            raise ArchiveError("export batch not found", status=404)
+        pkg_rows = conn.execute(
+            "SELECT package_no, filename, first_seq, last_seq, frame_count,"
+            " size_bytes FROM export_package WHERE batch_id = ? ORDER BY package_no",
+            (batch_id,),
+        ).fetchall()
+        return BatchView(
+            id=b["id"], byte_limit=b["byte_limit"],
+            frame_count=b["frame_count"], package_count=b["package_count"],
+            created_at=b["created_at"],
+            packages=tuple(
+                PackageView(package_no=p["package_no"], filename=p["filename"],
+                            first_seq=p["first_seq"], last_seq=p["last_seq"],
+                            frame_count=p["frame_count"], size_bytes=p["size_bytes"])
+                for p in pkg_rows),
+        )
+    finally:
+        conn.close()
+
+
+def download_package(dbp: str, archive_id: int, batch_id: int,
+                     package_no: int) -> tuple[str, bytes]:
+    """Return ``(filename, payload)`` for one frozen package file."""
+    conn = connect(dbp)
+    try:
+        _archive_row(conn, archive_id)
+        row = conn.execute(
+            "SELECT p.filename, p.payload_bytes, p.size_bytes FROM export_package p"
+            " JOIN export_batch b ON b.id = p.batch_id"
+            " WHERE b.id = ? AND b.archive_id = ? AND p.package_no = ?",
+            (batch_id, archive_id, package_no),
+        ).fetchone()
+        if row is None:
+            raise ArchiveError("package not found", status=404)
+        payload = bytes(row["payload_bytes"])
+        if len(payload) != row["size_bytes"]:
+            raise ArchiveError("stored package size is inconsistent", status=500)
+        return row["filename"], payload
+    finally:
+        conn.close()

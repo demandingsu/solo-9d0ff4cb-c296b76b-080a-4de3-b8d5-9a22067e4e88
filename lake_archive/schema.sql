@@ -66,3 +66,36 @@ CREATE TABLE IF NOT EXISTS revision (
 );
 
 CREATE INDEX IF NOT EXISTS revision_by_frame ON revision (archive_id, seq, id);
+
+-- A size-limited export batch: the whole frame set of an archive captured
+-- from one committed state and split into partner-importer-sized CSV files.
+-- The rendered bytes are frozen at generation time; later corrections of the
+-- live frame table never mutate a stored batch, so a download stays identical
+-- to what was produced on the batch's created_at.
+CREATE TABLE IF NOT EXISTS export_batch (
+    id              INTEGER PRIMARY KEY,
+    archive_id      INTEGER NOT NULL REFERENCES archive(id) ON DELETE CASCADE,
+    byte_limit      INTEGER NOT NULL CHECK (byte_limit > 0),
+    frame_count     INTEGER NOT NULL CHECK (frame_count > 0),
+    package_count   INTEGER NOT NULL CHECK (package_count > 0),
+    created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+);
+
+CREATE INDEX IF NOT EXISTS export_batch_by_archive ON export_batch (archive_id, id);
+
+-- One rendered CSV package of an export batch.  payload_bytes is the exact
+-- file offered for download (header plus its frames, with the original line
+-- terminator); size_bytes = length(payload_bytes) and never exceeds the
+-- batch's byte_limit.  Packages are numbered from 1 in frame order.
+CREATE TABLE IF NOT EXISTS export_package (
+    batch_id        INTEGER NOT NULL REFERENCES export_batch(id) ON DELETE CASCADE,
+    package_no      INTEGER NOT NULL,
+    filename        TEXT    NOT NULL,
+    first_seq       INTEGER NOT NULL,
+    last_seq        INTEGER NOT NULL,
+    frame_count     INTEGER NOT NULL CHECK (frame_count > 0),
+    size_bytes      INTEGER NOT NULL,
+    payload_bytes   BLOB    NOT NULL,
+    PRIMARY KEY (batch_id, package_no)
+);
+

@@ -55,11 +55,13 @@ def create_app(db_path: str | None = None) -> Flask:
         try:
             summary = store.get_archive(db(), archive_id)
             frames = store.list_frames(db(), archive_id)
+            batches = store.list_batches(db(), archive_id)
         except store.ArchiveError as exc:
             abort(exc.status, exc.message)
         return views.archive_page(summary, frames,
                                   request.args.get("notice"),
-                                  request.args.get("kind", "ok"))
+                                  request.args.get("kind", "ok"),
+                                  batches=batches)
 
     def frame_response(archive_id: int, seq: int, notice=None, kind="ok", status=200):
         try:
@@ -91,9 +93,11 @@ def create_app(db_path: str | None = None) -> Flask:
             try:
                 summary = store.get_archive(db(), archive_id)
                 frames = store.list_frames(db(), archive_id)
+                batches = store.list_batches(db(), archive_id)
             except store.ArchiveError as inner:
                 abort(inner.status, inner.message)
-            return views.archive_page(summary, frames, missing_seq=seq_num), 404
+            return views.archive_page(summary, frames, missing_seq=seq_num,
+                                      batches=batches), 404
         return redirect(url_for("show_frame", archive_id=archive_id, seq=seq_num))
 
     @app.post("/archives/<int:archive_id>/frames/<int:seq>/correct")
@@ -129,6 +133,51 @@ def create_app(db_path: str | None = None) -> Flask:
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    def _archive_page_with_notice(archive_id: int, message: str, kind: str,
+                                  status: int, byte_limit_value: str = ""):
+        try:
+            summary = store.get_archive(db(), archive_id)
+            frames = store.list_frames(db(), archive_id)
+            batches = store.list_batches(db(), archive_id)
+        except store.ArchiveError as exc:
+            abort(exc.status, exc.message)
+        return views.archive_page(summary, frames, notice=message, notice_kind=kind,
+                                  batches=batches, byte_limit_value=byte_limit_value), status
+
+    @app.post("/archives/<int:archive_id>/batches")
+    def create_batch(archive_id: int):
+        raw_limit = (request.form.get("byte_limit") or "").strip()
+        try:
+            byte_limit = int(raw_limit, 10)
+        except ValueError:
+            return _archive_page_with_notice(
+                archive_id, "每包字节上限必须是正整数。", "bad", 400, raw_limit)
+        try:
+            batch_id = store.create_export_batch(db(), archive_id, byte_limit)
+        except store.PackageError as exc:
+            # No batch row was written: the failed planning aborts the
+            # transaction, so no half batch can ever appear on the page.
+            return _archive_page_with_notice(archive_id, exc.message, "bad", exc.status)
+        except store.ArchiveError as exc:
+            return _archive_page_with_notice(
+                archive_id, exc.message, "bad", exc.status, raw_limit)
+        return redirect(url_for("show_archive", archive_id=archive_id,
+                                notice="已生成分批导出 #%d。" % batch_id))
+
+    @app.get("/archives/<int:archive_id>/batches/<int:batch_id>/packages/<int:package_no>/download")
+    def download_package(archive_id: int, batch_id: int, package_no: int):
+        try:
+            filename, payload = store.download_package(
+                db(), archive_id, batch_id, package_no)
+        except store.ArchiveError as exc:
+            abort(exc.status, exc.message)
+        safe_name = "".join(ch for ch in filename if ch not in '"\\\r\n')
+        response = Response(payload, mimetype="text/csv; charset=utf-8")
+        response.headers["Content-Disposition"] = (
+            'attachment; filename="%s"' % safe_name)
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     @app.get("/healthz")
     def healthz():
         return "ok", 200, {"Content-Type": "text/plain; charset=utf-8"}
@@ -136,6 +185,7 @@ def create_app(db_path: str | None = None) -> Flask:
     @app.errorhandler(400)
     @app.errorhandler(404)
     @app.errorhandler(409)
+    @app.errorhandler(422)
     def on_error(err):
         return views.error_page(err.code, getattr(err, "description", "请求无法完成。")), err.code
 

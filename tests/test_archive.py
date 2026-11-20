@@ -288,6 +288,208 @@ class TestExport(Base):
         self.assertNotIn(b"\n", out.replace(b"\r\n", b""))
 
 
+class TestExportBatch(Base):
+    """Size-limited batch export: packing, cross-package references, limits."""
+
+    def create_batch(self, limit):
+        bid = store.create_export_batch(self.db, self.aid, limit)
+        return store.get_batch(self.db, self.aid, bid)
+
+    def payload(self, batch_id, package_no):
+        return self.client.get(
+            "/archives/%d/batches/%d/packages/%d/download"
+            % (self.aid, batch_id, package_no)).data
+
+    def test_single_package_under_limit_matches_full_export(self):
+        b = self.create_batch(10_000)
+        self.assertEqual(b.package_count, 1)
+        self.assertEqual(b.frame_count, 5)
+        self.assertEqual(self.payload(b.id, 1), self.download())
+
+    def test_packages_split_only_when_next_frame_does_not_fit(self):
+        # Header is 73 bytes; with an 180-byte cap frames 1-3 fit (165 B),
+        # frame 4 would overflow, so it opens package 2.
+        b = self.create_batch(180)
+        self.assertEqual([p.package_no for p in b.packages], [1, 2])
+        ranges = [(p.first_seq, p.last_seq) for p in b.packages]
+        self.assertEqual(ranges, [(1, 3), (4, 5)])
+        for p in b.packages:
+            payload = self.payload(b.id, p.package_no)
+            self.assertEqual(len(payload), p.size_bytes)
+            self.assertLessEqual(len(payload), 180)
+            self.assertTrue(payload.startswith(b"seq,sampled_at_utc,"))
+
+    def test_size_counts_header_and_line_terminators(self):
+        b = self.create_batch(10_000)
+        p = b.packages[0]
+        payload = self.payload(b.id, 1)
+        # six lines: one header + five frames, each terminated by \n
+        self.assertEqual(payload.count(b"\n"), 6)
+        self.assertEqual(p.size_bytes, len(payload))
+
+    def test_delta_kept_when_base_in_same_package_rewritten_otherwise(self):
+        b = self.create_batch(180)
+        rows1, _ = csvio.parse_csv(self.payload(b.id, 1))
+        rows2, _ = csvio.parse_csv(self.payload(b.id, 2))
+        by1 = {r.seq: r for r in rows1}
+        by2 = {r.seq: r for r in rows2}
+        # frame 2 stays a delta because base frame 1 shares package 1
+        self.assertEqual(by1[2].stored_kind, "delta")
+        self.assertEqual(by1[2].base_seq, 1)
+        self.assertEqual(by1[2].stored_mc, 250)
+        # frames 4 (base 2) and 5 (base 1) cross the boundary: absolute,
+        # carrying their restored temperatures and no base reference
+        for seq, restored in ((4, -1350), (5, -3300)):
+            self.assertEqual(by2[seq].stored_kind, "absolute")
+            self.assertIsNone(by2[seq].base_seq)
+            self.assertEqual(by2[seq].stored_mc, restored)
+
+    def test_every_package_restores_authoritative_values_independently(self):
+        b = self.create_batch(180)
+        expected = {f.seq: f.restored_mc for f in self.frames().values()}
+        covered = []
+        for p in b.packages:
+            rows, _ = csvio.parse_csv(self.payload(b.id, p.package_no))
+            restored = {}
+            for r in rows:
+                covered.append(r.seq)
+                restored[r.seq] = (r.stored_mc if r.base_seq is None
+                                   else r.stored_mc + restored[r.base_seq])
+            for seq, value in restored.items():
+                self.assertEqual(value, expected[seq])
+        self.assertEqual(sorted(covered), [1, 2, 3, 4, 5])
+        self.assertEqual(len(covered), len(set(covered)))  # no duplicates
+
+    def test_frame_too_large_alone_reports_its_seq_and_writes_nothing(self):
+        before_batches = store.list_batches(self.db, self.aid)
+        with self.assertRaises(store.PackageError) as ctx:
+            store.create_export_batch(self.db, self.aid, 10)
+        self.assertEqual(ctx.exception.seq, 1)
+        self.assertEqual(ctx.exception.status, 422)
+        # no half batch: neither batch nor package rows were written
+        self.assertEqual(store.list_batches(self.db, self.aid), before_batches)
+        conn = store.connect(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM export_package").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    def test_over_limit_http_path_shows_frame_and_no_half_batch(self):
+        r = self.client.post("/archives/%d/batches" % self.aid,
+                             data={"byte_limit": "10"})
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("帧 1", r.data.decode())
+        page = self.client.get("/archives/%d" % self.aid).data.decode()
+        self.assertNotIn("已生成分批导出", page)
+
+    def test_frame_too_large_at_second_package_boundary_reports_its_seq(self):
+        # Frames 1 and 2 fit package 1 together; frame 3's own row is so wide
+        # that no fresh package can hold it -- the error must name frame 3,
+        # and the sealed in-memory package 1 must never reach the database.
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq,note\n"
+                   b"1,2024-01-01T00:00:00Z,1,absolute,,a\n"
+                   b"2,2024-01-01T01:00:00Z,2,absolute,,b\n"
+                   b"3,2024-01-01T02:00:00Z,3,absolute,," + b"x" * 200 + b"\n")
+        aid = store.create_archive(self.db, "wide", "w.csv", payload)
+        conn = store.connect(self.db)
+        try:
+            layout = csvio.CsvLayout.from_json(conn.execute(
+                "SELECT layout_json FROM archive WHERE id = ?", (aid,)
+            ).fetchone()["layout_json"])
+        finally:
+            conn.close()
+        frames = store.list_frames(self.db, aid)
+        sizes = [len(csvio.render_frame_row(f, layout)) for f in frames]
+        header = len(csvio.header_bytes(layout))
+        limit = header + sizes[0] + sizes[1]
+        self.assertGreater(header + sizes[2], limit)
+        with self.assertRaises(store.PackageError) as ctx:
+            store.create_export_batch(self.db, aid, limit)
+        self.assertEqual(ctx.exception.seq, 3)
+        conn = store.connect(self.db)
+        try:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM export_batch").fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM export_package").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    def test_invalid_limit_rejected(self):
+        for raw in ("", "abc", "0", "-5", "1.5"):
+            r = self.client.post("/archives/%d/batches" % self.aid,
+                                 data={"byte_limit": raw})
+            self.assertEqual(r.status_code, 400, raw)
+        self.assertEqual(store.list_batches(self.db, self.aid), [])
+
+    def test_batch_is_frozen_by_later_corrections(self):
+        b = self.create_batch(180)
+        frozen = {p.package_no: self.payload(b.id, p.package_no)
+                  for p in b.packages}
+        self.correct(1, seen=-1500, new=-2000)
+        for no, payload in frozen.items():
+            self.assertEqual(self.payload(b.id, no), payload)
+        # a freshly generated batch reflects the corrected state instead
+        b2 = self.create_batch(180)
+        self.assertNotEqual(
+            self.payload(b2.id, 1), frozen[1])
+
+    def test_download_headers_and_unknown_package_404(self):
+        b = self.create_batch(10_000)
+        r = self.client.get(
+            "/archives/%d/batches/%d/packages/1/download" % (self.aid, b.id))
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("attachment", r.headers["Content-Disposition"])
+        self.assertIn(".csv", r.headers["Content-Disposition"])
+        self.assertEqual(r.headers["Cache-Control"], "no-store")
+        missing = self.client.get(
+            "/archives/%d/batches/%d/packages/9/download" % (self.aid, b.id))
+        self.assertEqual(missing.status_code, 404)
+        self.assertEqual(self.client.get(
+            "/archives/%d/batches/999/packages/1/download" % self.aid).status_code, 404)
+
+    def test_archive_page_lists_batches_and_packages(self):
+        b = self.create_batch(180)
+        page = self.client.get("/archives/%d" % self.aid).data.decode()
+        self.assertIn("分批导出", page)
+        self.assertIn(
+            "/archives/%d/batches/%d/packages/1/download" % (self.aid, b.id), page)
+        self.assertIn(str(b.packages[0].size_bytes), page)
+
+    def test_layout_including_crlf_and_extras_is_preserved_per_package(self):
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq,site\r\n"
+                   b"1,2024-01-01T00:00:00Z,-1500,absolute,,north\r\n"
+                   b"2,2024-01-01T01:00:00Z,250,delta,1,north\r\n"
+                   b"3,2024-01-01T02:00:00Z,500,absolute,,south\r\n"
+                   b"4,2024-01-01T03:00:00Z,-100,delta,2,south\r\n")
+        aid = store.create_archive(self.db, "crlf-batch", "d.csv", payload)
+        bid = store.create_export_batch(self.db, aid, 150)
+        b = store.get_batch(self.db, aid, bid)
+        self.assertGreater(b.package_count, 1)
+        for p in b.packages:
+            data = store.download_package(self.db, aid, bid, p.package_no)[1]
+            self.assertIn(b"\r\n", data)
+            self.assertNotIn(b"\n", data.replace(b"\r\n", b""))
+            self.assertTrue(b"north" in data or b"south" in data)
+
+    def test_blank_kind_column_rewritten_frame_stays_parseable(self):
+        payload = (b"seq,sampled_at_utc,value_millidegrees_c,kind,base_seq\n"
+                   b"1,2024-01-01T00:00:00Z,-1500,,\n"
+                   b"2,2024-01-01T01:00:00Z,250,,1\n"
+                   b"3,2024-01-01T02:00:00Z,500,,\n"
+                   b"4,2024-01-01T03:00:00Z,-100,,2\n")
+        aid = store.create_archive(self.db, "blank", "e.csv", payload)
+        bid = store.create_export_batch(self.db, aid, 140)
+        b = store.get_batch(self.db, aid, bid)
+        all_rows = []
+        for p in b.packages:
+            data = store.download_package(self.db, aid, bid, p.package_no)[1]
+            rows, _ = csvio.parse_csv(data)
+            all_rows.extend(rows)
+        self.assertEqual(sorted(r.seq for r in all_rows), [1, 2, 3, 4])
+
+
 class TestPages(Base):
     def test_index_and_archive_pages(self):
         self.assertEqual(self.client.get("/").status_code, 200)
